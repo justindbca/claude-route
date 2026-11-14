@@ -20,7 +20,7 @@ claude-via-home:
     - The field machine cannot reach the Claude API. Loading this workflow sends every Claude session of the field fleet through home; nothing tests the direct route.
   source:
     repo: ~/claude-route
-    ref: 788a839c9ef6a4a4bbc3492605caed13e3c6260d   # load accepts this commit or a later one with the same applet files
+    ref: 921b6b4fe79863a6d631b3942e010d9554b8db5f   # load accepts this commit or a later one with the same applet files
     from: home-machine
   applets:
     - machine: home-machine

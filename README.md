@@ -237,11 +237,11 @@ the applet with exit code 78.
 
 | Symptom | Cause | Action |
 |---|---|---|
-| `applet-tunnel-1` is in state `config_error`. | A parameter is wrong, or no route connected. | Read the last line of its log. See [docs/operations.md](docs/operations.md). |
+| `applet-tunnel-1` is in state `config_error`. | A parameter is wrong, the inventory or a port is unusable, or `field.max_failed_rounds` is above 0 and no route connected in that many rounds. Failed rounds alone do not stop the applet with the default `0`. | Read the last line of its log. See [docs/operations.md](docs/operations.md). |
 | `config error: ... machine ...` | `field.machine` is missing or is not in the inventory. | Set `field.machine` to the home machine's inventory name. |
 | `... is already in use by another program` | Another program listens on `field.local_port` or a route port. | Change the port. See [docs/operations.md](docs/operations.md). |
-| `no ssh target of machine ... connects` | No ssh route reached the home proxy. | Fix a route, then run `fleetmux applet start applet-tunnel-1`. |
-| Claude sessions on the field machine do not start. | The field port is closed. The fleet holds sessions until it opens. | Check the phase of `applet-tunnel-1`. |
+| `no ssh target of machine ... connects` | `field.max_failed_rounds` is above 0, and no ssh route reached the home proxy in that many rounds. | Set `field.max_failed_rounds` to `0` or remove it. Fix a route, then run `fleetmux applet start applet-tunnel-1`. |
+| Claude sessions on the field machine do not start. | The field port is closed. The fleet holds sessions until it opens. After sleep or without network the applet keeps reconnecting. | Check the phase of `applet-tunnel-1`. `reconnecting: round <n> in <s> s; ...` shows the next round and why the last one failed. See [docs/operations.md](docs/operations.md), section 2a. |
 | `load` refuses the checkout. | The applet files differ from `source.ref`, or are not committed. | Commit them, and set `source.ref` to that commit. Save the entry again. |
 
 ## License

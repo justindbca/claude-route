@@ -154,15 +154,23 @@ The applet takes a better route only when all of these hold:
 1. The route in use drops and no other route has a score. The local port closes.
 2. The fleet holds new Claude sessions at launch.
 3. After `field.restart_delay_s` a round starts every route again.
-4. A round fails when every route of the round is down. The applet waits `field.restart_delay_s` and starts the
-   next round.
-5. A route that comes up reopens the port and resets the round count.
+4. A round fails when every route of the round is down. The applet waits and starts the next round. The wait
+   after failed round `k` in a row is `min(field.restart_delay_max_s, field.restart_delay_s * 2 ** (k - 1))`.
+   With the defaults the waits are 5, 10, 20, 40, 60, 60, ... s.
+5. A route that comes up reopens the port and resets the round count. The next loss starts again at
+   `field.restart_delay_s`.
 6. When every route of that round is measured, the applet takes the best route if it beats the one in use by
    the margin. Hold and cooldown do not apply.
-7. After `field.max_failed_rounds` failed rounds in a row, the applet stops every ssh child, confirms that the
-   port is closed and exits with code 78.
-8. Its last stderr line names every target of the last round and why each failed. The fleet shows this line as
-   the reason. The fleet does not restart the applet.
+7. With `field.max_failed_rounds: 0`, the default, failed rounds never end the applet. The port stays closed,
+   the fleet keeps holding new sessions, and rounds go on until a route comes up. A network failure is not a
+   configuration error.
+8. With a positive `field.max_failed_rounds`, the applet keeps the old rule. After that many counted failed
+   rounds in a row (3.8 and section 4 say which rounds count), it stops every ssh child, confirms that the port is closed and exits with code 78. Its last stderr line
+   names every target of the last round and why each failed. The fleet shows this line as the reason. The fleet
+   does not restart the applet.
+9. Each failed round writes one log line with the reason of each target. While the same result repeats, the
+   applet writes the lines of a round at most once per 600 s. A changed result is written at once. See
+   [operations.md](operations.md), section 3.
 
 ### 3.8 Exit codes
 
@@ -173,7 +181,11 @@ The applet takes a better route only when all of these hold:
 | `applet-homeproxy-1` | 1 | Three self checks in a row failed. | Restarted. |
 | `applet-tunnel-1` | 78 | The inventory cannot be read, or has no such machine, or no reach entry. | State `config_error`. Not restarted. |
 | `applet-tunnel-1` | 78 | `field.local_port` or a route port is in use by another program. | State `config_error`. Not restarted. |
-| `applet-tunnel-1` | 78 | `field.max_failed_rounds` rounds in a row without a route. | State `config_error`. Not restarted. |
+| `applet-tunnel-1` | 78 | Only with a positive `field.max_failed_rounds`: that many counted rounds in a row without a route. A wake sets the count to 0, and rounds that fail within 60 s of a wake are not counted, so short wakes never reach the limit (section 4). A route that comes up also sets the count to 0. | State `config_error`. Not restarted. |
+
+With the default `field.max_failed_rounds: 0`, failed rounds never end the applet. Exit code 78 then means a
+configuration error only: an invalid or missing parameter, an inventory that cannot be read, no such machine, no
+reach entry, or a port in use by another program.
 
 ## 4. Reconnection after sleep or network loss
 
@@ -184,9 +196,52 @@ The applet takes a better route only when all of these hold:
 4. When another route still has a score, new connections move to it (3.5).
 5. When no route is left, the applet runs rounds (3.7). The field port is closed during the rounds.
 6. A round starts every route. The first route that comes up reopens the port.
-7. With the defaults, the applet tries 10 rounds. Each round waits 5 s, then tries for at most 30 s.
+7. With the defaults, the applet never stops trying. The first round starts 5 s after the loss. The wait
+   between failed rounds doubles from 5 s up to 60 s. Each round tries for at most 30 s.
 8. A Claude turn that runs while the port closes ends with an error. The fleet holds that session and delivers
    the turn again after the port opens.
+
+Wake-up and network change. The applet does not wait for the timers above when the machine wakes or the network
+returns. The target: from an open lid with a working network to an open field port, the applet itself waits at
+most 2 s. The ssh handshake is not part of that time.
+
+9. Wake detection. The applet keeps the wall clock and the monotonic clock of each pass of its loop. The
+   monotonic clock does not advance during sleep. When the gap between the two clocks grows by
+   `field.wake_jump_s` or more between two passes, or a pass comes that much later than planned, the machine
+   has woken up. The applet logs `tunnel: woke up (clock jump <n> s); probing every route now`.
+10. The loop never pauses longer than `field.net_check_interval_s`. A wake is therefore found at most that long
+    after the machine resumes.
+11. Wake with a route up. The applet drops every probe that was in flight before the sleep and probes every up
+    route at once, with the short time limit `field.wake_probe_timeout_s` instead of `field.probe_timeout_s`.
+    A route whose probe fails or does not answer in time is stopped on the spot and started again. That drop does not count in the score. Routes whose check has not answered yet are
+    not picked. When the route in use fails its check and no checked route is left, a round starts at once,
+    without `field.restart_delay_s`. The applet does not wait for ssh keepalive, which takes up to
+    `server_alive_interval_s * server_alive_count_max` (45 s with the defaults).
+12. Wake with no route. The applet stops the ssh children of a running round without logging them as failures,
+    resets the round count to 1 and starts a new round at once. The wait starts again at `field.restart_delay_s`.
+13. Network check. While no route is up, every `field.net_check_interval_s` the applet reads the network
+    signature: the local source address that the kernel picks for the documentation addresses `192.0.2.1` and
+    `2001:db8::1`. It opens a UDP socket and calls `connect()`, which is a route lookup only. It sends no packet
+    and never contacts the Claude API or any other host. No default route gives an empty signature.
+14. Only the edge from no network to a network starts a round at once: the last signature was empty and the new
+    one has an address. The applet then logs `tunnel: network changed (none -> <new>); round now`, stops the ssh
+    children of a running round, resets the round number to 1, so the wait starts again at
+    `field.restart_delay_s`, and starts a round at once. It does not wait for the capped wait. Any other change,
+    for example a new address on a network that was already up, starts no round; the rounds keep their wait.
+15. Short wakes. A sleeping machine may wake for a few seconds without network. Each wake resets the round
+    number to 1, so the failed rounds of short wakes never raise the wait. For a positive
+    `field.max_failed_rounds`, a wake also sets the count to 0, and a failed round counts only when it ends 60 s
+    or more after the last wake (a fixed value in the code). The failed rounds of short wakes therefore never
+    add up to exit code 78. A machine that stays awake without network still reaches the limit. The next wake
+    tries at once again.
+16. An old ssh child of the applet itself that does not end, even after SIGKILL, keeps its route port. The
+    applet logs `tunnel: ssh pid <pid> of <target> does not exit; port <p> stays with it` and keeps it in a
+    list of its own children. A later start of that route counts as one failed attempt,
+    `tunnel: <target> failed: old ssh pid <pid> still holds port <p>`, and waits for the old process to end. That
+    port is not a port in use by another program and never leads to exit code 78. A stop of the applet kills
+    such children again.
+17. A network that keeps its default route while it is down, for example a VPN with an exit node, does not
+    change the signature. Wake detection and the rounds of 3.7 cover that case.
 
 ## 5. Security boundary
 
@@ -248,10 +303,14 @@ Each applet publishes a phase. The fleet shows it at the top of the applet's tab
 | `applet-homeproxy-1` | `serving 127.0.0.1:<port>, <n> tunnels open` | Healthy. |
 | `applet-homeproxy-1` | `self check failed (<n>): <reason>` | The last self checks failed. |
 | `applet-tunnel-1` | `up: via <target> <ms> (fail <f>/<n>, drops <d>) \| switched <hh:mm:ss> from <target>: <reason> \| standby: <target> <ms\|down\|unfit\|connecting>, ...` | A route is in use. `switched never` until the first switch. |
-| `applet-tunnel-1` | `connecting: round <n>/<max>, trying <target> (target i/n), ...` | First start, no route up yet. |
-| `applet-tunnel-1` | `reconnecting: round <n>/<max>, trying <target> (target i/n), ...` | No route; a round runs. |
-| `applet-tunnel-1` | `reconnecting: round <n>/<max> in <s> s; <note>` | No route; waiting for the next round. |
-| `applet-tunnel-1` | `no route: <reason>` | The applet is exiting with code 78. |
+| `applet-tunnel-1` | `connecting: round <n>[/<max>], trying <target> (target i/n), ...[; <last round>]` | First start, no route up yet. |
+| `applet-tunnel-1` | `reconnecting: round <n>[/<max>], trying <target> (target i/n), ...[; <last round>]` | No route; a round runs. |
+| `applet-tunnel-1` | `reconnecting: round <n>[/<max>] in <s> s; <note>` | No route; waiting for the next round. |
+| `applet-tunnel-1` | `no route: <reason>` | Only with a positive `field.max_failed_rounds`: the applet is exiting with code 78. |
+
+`/<max>` appears only when `field.max_failed_rounds` is above 0. `<last round>` and `<note>` after a failed round
+are `round <n-1>: no target connects (<target>: <why>; ...)`, the reason of each target of the last round, in the
+order in which the targets failed. Before the first round after a drop, `<note>` is `dropped (<target> dropped: <why>)`.
 
 ### 6.3 What load and unload leave
 
@@ -273,5 +332,6 @@ Each applet publishes a phase. The fleet shows it at the top of the applet's tab
 5. A switch does not move existing connections. A long connection on a degraded route stays there until it ends.
 6. The number of routes is limited by the size of `field.route_ports`. Extra targets are skipped and logged once.
 7. `field.local_port` and `session_env.port` are set in two files. They must be changed together.
-8. After exit code 78, the field applet stays stopped until `fleetmux applet start applet-tunnel-1`.
+8. After exit code 78, the field applet stays stopped until `fleetmux applet start applet-tunnel-1`. With the
+   default `field.max_failed_rounds: 0`, only a configuration error leads to exit code 78.
 9. The list of refused ports on the field machine is fixed in the code.

@@ -54,11 +54,18 @@ The refused ports are fixed in the code: 7890, 9090, 9091, 17890, 19091, 18888, 
 | Key | Default | Meaning | When to change |
 |---|---|---|---|
 | `attempt_timeout_s` | `30` | Seconds from one route's ssh start to its first good probe. Later, that start has failed. Range 0.5-600. | A route takes longer to come up. |
-| `restart_delay_s` | `5` | Seconds to wait when no route is left, before a round and between rounds. Range 0.1-3600. | Rarely. |
-| `max_failed_rounds` | `10` | Rounds in a row in which no route comes up before exit code 78. Integer 1-10000. | The network takes longer to return after sleep. Raise it. |
+| `restart_delay_s` | `5` | Seconds to wait when no route is left, before the first round. Also the first wait between failed rounds; the wait doubles after each failed round in a row, up to `restart_delay_max_s`. A route that comes up resets the wait to this value. Range 0.1-3600. | Rarely. |
+| `restart_delay_max_s` | `60` | Upper limit of the wait between failed rounds, in seconds. The wait after failed round `k` in a row is `min(restart_delay_max_s, restart_delay_s * 2 ** (k - 1))`. Range 0.1-3600, and at least `restart_delay_s`. | Raise it to try less often during long times without network. Lower it to reconnect sooner after the network returns. |
+| `max_failed_rounds` | `0` | `0`: failed rounds never stop the applet; it keeps the port closed and goes on until a route comes up. A positive number: that many rounds in a row in which no route comes up end the applet with exit code 78, which the fleet does not restart. A wake and a route that comes up set the count to 0. A round that fails within 60 s of a wake is not counted, so short wakes never reach the limit. Integer 0-10000. | Rarely. Set a positive number only if you want the applet to stop after that many failed rounds. |
+| `wake_jump_s` | `10` | Seconds of clock jump between two passes of the loop that count as a wake from sleep: the wall clock moved this much more than the monotonic clock, or a pass came this much later than planned. A wake probes every up route at once, or starts a round at once when no route is up, and resets the round number and the `max_failed_rounds` count. Range 1-86400. | Raise it if a busy machine reports wakes that were not sleep. Lower it to catch shorter sleeps. |
+| `net_check_interval_s` | `1` | Seconds between light network checks while no route is up, and the longest pause of the loop. A check reads the local source address for a documentation address; it sends nothing and never contacts the API. Only the change from no network to a network starts a round at once. Range 0.2-60. | Rarely. |
+| `wake_probe_timeout_s` | `1` | Time limit of the probe of each up route right after a wake. A route that does not answer within it is stopped and started again at once. Probes in flight from before the sleep are dropped. Other probes use `probe_timeout_s`. Range 0.1-60. | A route answers slowly right after a wake and is restarted for no reason. Raise it. |
 | `check_interval_s` | `10` | Seconds between probes of the route in use. Range 0.1-3600. | Failures of the route in use must be found faster or slower. |
 | `unhealthy_restart_s` | `60` | Seconds of failing probes after which an up route counts as a drop. Range 1-86400. | Rarely. |
 | `stop_wait_s` | `5` | On SIGTERM: seconds for each ssh stop and for the confirmation that the listeners are gone. Range 0.1-60. | Rarely. Keep the row's `stop_grace_s` larger than the stop takes. |
+
+An older parameter file may set `max_failed_rounds: 10`. That file keeps the old stop after 10 failed rounds. Set
+the value to `0` or remove the line to keep the applet reconnecting.
 
 ### Measurement and score
 

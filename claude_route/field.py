@@ -31,8 +31,25 @@ only, existing ones stay on their route until they end or that route's ssh goes 
   probes are not a drop: they only count in the score and towards ``failover_after_fails``.
 - No route: when the route in use drops and no other route has a score, ``127.0.0.1:<local_port>`` is closed
   (sessions wait at launch). ``restart_delay_s`` later a round starts every route again; a round in which none
-  comes up is followed, ``restart_delay_s`` later, by another one. ``max_failed_rounds`` such rounds in a row
-  end the applet with exit code 78 and one stderr line naming every target of the last round.
+  comes up is followed by another one after a wait that starts at ``restart_delay_s`` and doubles after each
+  failed round in a row, up to ``restart_delay_max_s``; a route that comes up starts the wait over. A network
+  that is gone is never a reason to stop: by default (``max_failed_rounds`` 0) the rounds go on until a route
+  comes up. A positive ``max_failed_rounds`` keeps the old exit: that many failed rounds in a row end the
+  applet with exit code 78 and one stderr line naming every target of the last round.
+- Wake-up: when the clocks jump by ``wake_jump_s`` or more between two loops (the wall clock against the
+  monotonic one, which stands still during sleep; or a loop later than its own delay), the applet probes every
+  route that is up at once and stops and restarts each one that does not answer (not a drop), and with no
+  route starts a round at once with the wait and the round count starting over. The wake-up probe waits
+  ``wake_probe_timeout_s``. Rounds that fail within ``SHORT_WAKE_S`` of a wake-up (a short system wake in the
+  night) never count toward ``max_failed_rounds``. The main loop never pauses longer than
+  ``net_check_interval_s``. An old ssh child of this applet that does not end keeps its route port; that route
+  waits for it (it is not another program).
+- Network change: with no route, the default routes are looked up every ``net_check_interval_s``
+  (``network_signature``: UDP sockets connected to numeric documentation addresses, no name lookup, nothing is
+  sent); when there was no network and now there is, a round starts at once and the wait starts over. The check
+  never holds a round back: with no network seen, a round still starts when its wait ends.
+- Rounds that fail for the same reasons as the round before are logged once per ``REPEAT_LOG_S``: the round
+  lines in between (start, failed, measure, round) are left out, and the next line logged counts them.
 - SIGTERM: every ssh child is stopped (SIGTERM, then SIGKILL after ``stop_wait_s``), the relay is shut down,
   the applet waits until ``local_port`` and the route ports refuse connections, then exits 0.
 
@@ -72,8 +89,12 @@ DEFAULTS = {
     'server_alive_count_max': 3,
     'connect_timeout_s': 10,
     'attempt_timeout_s': 30,       # one route: ssh start to the first good probe
-    'restart_delay_s': 5,          # no route left: wait before a round, and between rounds
-    'max_failed_rounds': 10,       # rounds in a row in which no route comes up before exit 78
+    'restart_delay_s': 5,          # no route left: wait before a round, and the first wait between rounds
+    'restart_delay_max_s': 60,     # the wait between rounds doubles after each failed round, up to this
+    'max_failed_rounds': 0,        # rounds in a row in which no route comes up before exit 78; 0: no limit
+    'wake_jump_s': 10,             # a clock jump this long between two loops is a wake-up: check routes now
+    'net_check_interval_s': 1,     # no route: network check period; also the longest pause of the main loop
+    'wake_probe_timeout_s': 1,     # the probe of each route right after a wake-up; slower: restarted at once
     'check_interval_s': 10,        # probe period of the route in use
     'unhealthy_restart_s': 60,     # up, then probes failing this long: a drop
     'stop_wait_s': 5,              # child stop and listener-gone confirmation, each
@@ -96,6 +117,8 @@ MACHINE_MISSING = ('machine is not set: set field.machine in claude_route.yaml t
 OPTION_RE = re.compile(r'[A-Za-z]+=[^\s]+\Z')
 CONNECT_POLL_S = 0.5               # probe period of a route that is still connecting
 PROBE_WAIT_S = 0.2                 # step period while a probe is in flight
+REPEAT_LOG_S = 600                 # rounds failing for the same reasons are logged once per this many seconds
+SHORT_WAKE_S = 60                  # failed rounds this soon after a wake-up count toward no max_failed_rounds
 
 
 def port_open(port, host=LOOPBACK, timeout=0.5):
@@ -104,6 +127,24 @@ def port_open(port, host=LOOPBACK, timeout=0.5):
             return True
     except OSError:
         return False
+
+
+# Documentation addresses (RFC 5737, RFC 3849): a UDP connect() to them is a routing lookup only, nothing is sent.
+ROUTE_LOOKUP = ((socket.AF_INET, '192.0.2.1'), (socket.AF_INET6, '2001:db8::1'))
+
+
+def network_signature():
+    """(IPv4 source address, IPv6 source address) the kernel picks for its default routes; None for a family
+    without one. No packet leaves the machine and no real host is named."""
+    out = []
+    for family, addr in ROUTE_LOOKUP:
+        try:
+            with socket.socket(family, socket.SOCK_DGRAM) as s:
+                s.connect((addr, 9))
+                out.append(s.getsockname()[0])
+        except OSError:
+            out.append(None)
+    return tuple(out)
 
 
 def health_probe(port, timeout):
@@ -212,6 +253,7 @@ class Route:
         self.fails_in_row = 0
         self.fail_since = None
         self.last_ok = False
+        self.wake_check = False    # up before a wake-up; not used until its next probe answers
 
     @property
     def up(self):
@@ -221,12 +263,14 @@ class Route:
 class Tunnel:
     def __init__(self, machine, targets, local_port=17892, remote_port=17891, route_ports=(17900, 17915),
                  ssh=('ssh',), ssh_options=(), server_alive_interval_s=15, server_alive_count_max=3,
-                 connect_timeout_s=10, attempt_timeout_s=30.0, restart_delay_s=5.0, check_interval_s=10.0,
-                 unhealthy_restart_s=60.0, stop_wait_s=5.0, max_failed_rounds=10, probe_timeout_s=5.0, samples=5,
+                 connect_timeout_s=10, attempt_timeout_s=30.0, restart_delay_s=5.0, restart_delay_max_s=60.0,
+                 check_interval_s=10.0, unhealthy_restart_s=60.0, stop_wait_s=5.0, max_failed_rounds=0,
+                 wake_jump_s=10.0, net_check_interval_s=1.0, wake_probe_timeout_s=1.0, probe_timeout_s=5.0,
+                 samples=5,
                  sample_gap_s=1.0, measure_interval_s=60.0, window_s=600.0, fail_penalty_ms=5000,
                  drop_penalty_ms=2000, switch_margin_ratio=0.3, switch_margin_ms=50, switch_hold_s=120.0,
                  switch_cooldown_s=300.0, failover_after_fails=3, clock=time.monotonic, wall=time.time,
-                 probe=None, executor=None):
+                 probe=None, executor=None, net_probe=None):
         self.machine = machine
         self.targets = list(targets)
         self.local_port = local_port
@@ -239,10 +283,14 @@ class Tunnel:
         self.connect_timeout_s = int(connect_timeout_s)
         self.attempt_timeout_s = attempt_timeout_s
         self.restart_delay_s = restart_delay_s
+        self.restart_delay_max_s = restart_delay_max_s
         self.check_interval_s = check_interval_s
         self.unhealthy_restart_s = unhealthy_restart_s
         self.stop_wait_s = stop_wait_s
         self.max_failed_rounds = int(max_failed_rounds)
+        self.wake_jump_s = wake_jump_s
+        self.net_check_interval_s = net_check_interval_s
+        self.wake_probe_timeout_s = wake_probe_timeout_s
         self.probe_timeout_s = probe_timeout_s
         self.samples = int(samples)
         self.sample_gap_s = sample_gap_s
@@ -257,9 +305,19 @@ class Tunnel:
         self.failover_after_fails = int(failover_after_fails)
         self.clock = clock
         self.wall = wall
-        # probe(route_port) -> (ok, info, elapsed_ms); executor(fn) runs one probe (a thread; tests: inline)
-        self.probe = probe or (lambda port: health_probe(port, self.probe_timeout_s))
+        # probe(route_port[, timeout]) -> (ok, info, elapsed_ms); executor(fn) runs one probe (a thread; tests:
+        # inline). The timeout is passed only for the wake-up probe (wake_probe_timeout_s).
+        self.probe = probe or (lambda port, timeout=None: health_probe(
+            port, self.probe_timeout_s if timeout is None else timeout))
         self.executor = executor or run_async
+        self.net_probe = net_probe or (lambda: network_signature())
+        self.last_tick = None      # (wall, monotonic, delay asked for) of the last step: wake-up detection
+        self.retry_now = False     # a route failed its wake-up probe: the round after a loss starts at once
+        self.net_sig = None        # network_signature() at the last round start or check
+        self.next_net_check = 0.0
+        self.woke_at = None        # monotonic time of the last wake-up
+        self.counted = 0           # failed rounds in a row that count toward max_failed_rounds
+        self.lingering = []        # (child, route port): own ssh children that did not end when stopped
         self.routes = []
         self.skipped = set()       # inventory targets past the size of route_ports (logged once)
         self.current = None        # the Route new connections go to; None: local_port is closed
@@ -272,6 +330,12 @@ class Tunnel:
         self.next_round_at = None
         self.wait_note = ''
         self.failures = []         # "target: reason" of the current round
+        self.last_failures = []    # ... of the last failed round (shown in the phase)
+        self.last_sig = None       # the sorted reasons of the last failed round
+        self.repeat = False        # the last failed round failed for the same reasons as the one before
+        self.quiet = False         # the current round's lines are not logged (a repeat within REPEAT_LOG_S)
+        self.logged_at = None      # when a failed round was last logged in full
+        self.unlogged = []         # numbers of the failed rounds not logged since then
         self.next_measure = 0.0
         self.switched_at = None
         self.last_switch = 'never'
@@ -310,8 +374,17 @@ class Tunnel:
         for name in ('server_alive_interval_s', 'server_alive_count_max', 'connect_timeout_s'):
             if type(s[name]) is not int or not 1 <= s[name] <= 3600:
                 raise ConfigError('%s must be an integer 1-3600, got %r' % (name, s[name]))
-        if type(s['max_failed_rounds']) is not int or not 1 <= s['max_failed_rounds'] <= 10000:
-            raise ConfigError('max_failed_rounds must be an integer 1-10000, got %r' % (s['max_failed_rounds'],))
+        if type(s['max_failed_rounds']) is not int or not 0 <= s['max_failed_rounds'] <= 10000:
+            raise ConfigError('max_failed_rounds must be an integer 0-10000 (0: no limit), got %r'
+                              % (s['max_failed_rounds'],))
+        wake_jump_s = check_seconds('wake_jump_s', s['wake_jump_s'], 1, 86400)
+        net_check_interval_s = check_seconds('net_check_interval_s', s['net_check_interval_s'], 0.2, 60)
+        wake_probe_timeout_s = check_seconds('wake_probe_timeout_s', s['wake_probe_timeout_s'], 0.1, 60)
+        restart_delay_s = check_seconds('restart_delay_s', s['restart_delay_s'], 0.1, 3600)
+        restart_delay_max_s = check_seconds('restart_delay_max_s', s['restart_delay_max_s'], 0.1, 3600)
+        if restart_delay_max_s < restart_delay_s:
+            raise ConfigError('restart_delay_max_s must be at least restart_delay_s (%g), got %r'
+                              % (restart_delay_s, s['restart_delay_max_s']))
         targets = reach(machine)
         ports_for(route_ports, targets, machine)
         if type(s['switch_margin_ratio']) not in (int, float) or not 0 <= s['switch_margin_ratio'] < 1:
@@ -323,11 +396,12 @@ class Tunnel:
                    server_alive_count_max=s['server_alive_count_max'],
                    connect_timeout_s=s['connect_timeout_s'],
                    attempt_timeout_s=check_seconds('attempt_timeout_s', s['attempt_timeout_s'], 0.5, 600),
-                   restart_delay_s=check_seconds('restart_delay_s', s['restart_delay_s'], 0.1, 3600),
+                   restart_delay_s=restart_delay_s, restart_delay_max_s=restart_delay_max_s,
                    check_interval_s=check_seconds('check_interval_s', s['check_interval_s'], 0.1, 3600),
                    unhealthy_restart_s=check_seconds('unhealthy_restart_s', s['unhealthy_restart_s'], 1, 86400),
                    stop_wait_s=check_seconds('stop_wait_s', s['stop_wait_s'], 0.1, 60),
-                   max_failed_rounds=s['max_failed_rounds'],
+                   max_failed_rounds=s['max_failed_rounds'], wake_jump_s=wake_jump_s,
+                   net_check_interval_s=net_check_interval_s, wake_probe_timeout_s=wake_probe_timeout_s,
                    probe_timeout_s=check_seconds('probe_timeout_s', s['probe_timeout_s'], 0.1, 600),
                    samples=check_number('samples', s['samples'], 1, 100, integer=True),
                    sample_gap_s=check_seconds('sample_gap_s', s['sample_gap_s'], 0, 3600),
@@ -407,7 +481,7 @@ class Tunnel:
         """Routes with a score (and a good last probe), best first; equal whole-ms scores in list order."""
         out = []
         for i, r in enumerate(self.routes):
-            if r is exclude or not r.up or (need_last_ok and not r.last_ok):
+            if r is exclude or not r.up or r.wake_check or (need_last_ok and not r.last_ok):
                 continue
             cost = self._cost(r, now)
             if not math.isinf(cost):
@@ -451,11 +525,16 @@ class Tunnel:
         return '%s (target %d/%d)' % (r.dest, self.routes.index(r) + 1, len(self.routes))
 
     def _spawn(self, r, now):
+        self.lingering = [(c, p) for c, p in self.lingering if c.poll() is None]
         if port_open(r.port):
+            own = next((c for c, p in self.lingering if p == r.port), None)
+            if own is not None:  # this applet's old ssh still holds the port: wait for it, not exit 78
+                self._attempt_failed(r, now, 'old ssh pid %d still holds port %d' % (own.pid, r.port))
+                return
             self._die('%s:%d (route port of %s) is already in use by another program; set field.route_ports to '
                       'a free range' % (LOOPBACK, r.port, r.dest))
         argv = self.argv(r.dest, r.port)
-        log('tunnel: start (target %d/%d) %s' % (self.routes.index(r) + 1, len(self.routes), ' '.join(argv)))
+        self._say('tunnel: start (target %d/%d) %s' % (self.routes.index(r) + 1, len(self.routes), ' '.join(argv)))
         r.gen += 1
         r.probing, r.burst_left, r.attempt_probes, r.last_info = False, 0, 0, 'no answer yet'
         try:  # same process group as the applet: the host's group sweep also reaches it
@@ -478,8 +557,13 @@ class Tunnel:
             child.wait(self.stop_wait_s)
         except subprocess.TimeoutExpired:
             child.kill()
-            child.wait(self.stop_wait_s)
-        log('tunnel: ssh pid %d stopped (%s)' % (child.pid, child.returncode))
+            try:
+                child.wait(self.stop_wait_s)
+            except subprocess.TimeoutExpired:
+                self.lingering.append((child, r.port))
+                log('tunnel: ssh pid %d of %s does not exit; port %d stays with it' % (child.pid, r.dest, r.port))
+                return
+        self._say('tunnel: ssh pid %d stopped (%s)' % (child.pid, child.returncode))
 
     def _stop_route(self, r):
         self._stop_child(r)
@@ -488,18 +572,20 @@ class Tunnel:
     def _gone(self, r):
         r.state, r.child, r.probing, r.next_probe, r.burst_left = 'down', None, False, None, 0
         r.gen += 1
+        r.wake_check = False
 
     def _attempt_failed(self, r, now, why):
-        log('tunnel: %s failed: %s' % (r.dest, why))
+        self._say('tunnel: %s failed: %s' % (r.dest, why))
         self._gone(r)
         self._log_measure(r, now, attempt=True, last=why)
         if self.current is None and self.in_round:
             self.failures.append('%s: %s' % (r.dest, why))
 
-    def _dropped(self, r, now, why):
+    def _dropped(self, r, now, why, count=True):
         log('tunnel: %s dropped: %s' % (r.dest, why))
         self._gone(r)
-        r.drops.append(now)
+        if count:
+            r.drops.append(now)
         r.down_why = why
 
     # ------------------------------------------------------------------ probes
@@ -512,9 +598,10 @@ class Tunnel:
 
     def _probe_off_loop(self, r, gen, port):
         results, probe = self.results, self.probe
+        timeout = self.wake_probe_timeout_s if r.wake_check else None
 
         def work():
-            ok, info, elapsed_ms = probe(port)
+            ok, info, elapsed_ms = probe(port) if timeout is None else probe(port, timeout)
             results.put((r, gen, ok, info, elapsed_ms / 1000.0))
 
         self.executor(work)
@@ -568,6 +655,13 @@ class Tunnel:
         self._record(r, now, ok, info, seconds)
 
     def _record(self, r, now, ok, info, seconds):
+        if r.wake_check:
+            r.wake_check = False
+            if not ok:  # the connection died during sleep: restart it now, not after ServerAlive or the gates
+                self._stop_child(r)
+                self._dropped(r, now, 'no answer after wake-up (%s)' % info, count=False)
+                self.retry_now, self.next_measure = True, now
+                return
         r.results.append((now, ok, seconds))
         self._prune(r, now)
         r.last_ok = ok
@@ -618,12 +712,17 @@ class Tunnel:
         line = 'tunnel: measure %s port %d ok %d/%d median %s fail %d/%d drops %d cost %s %s' % (
             r.dest, r.port, ok, n, 'n/a' if median is None else ms(median), failed, len(r.results), len(r.drops),
             ms(self._cost(r, now)), 'current' if r is self.current else 'standby')
-        log(line + (' last: %s' % last if last else ''))
+        self._say(line + (' last: %s' % last if last else ''))
 
     # ------------------------------------------------------------------ choosing
     def _switch(self, now, to, reason, cooldown):
         old = self.current
         name = old.dest if old is not None else 'none'
+        if old is None:
+            self.quiet = False
+            if self.unlogged:
+                log('tunnel: %s not logged (rounds %d-%d)' % (self._same(len(self.unlogged)), self.unlogged[0],
+                                                              self.unlogged[-1]))
         log('tunnel: switch %s -> %s: %s' % (name, to.dest, reason))
         self.current, self.switched_at, self.better = to, now, None
         if not reason.startswith('startup'):  # the start's own picks are not switches in the phase
@@ -640,7 +739,8 @@ class Tunnel:
                 self.settling, self.settle_kind = True, 'recovered'
             self.ever_up = True
             self.round, self.reconnecting, self.in_round, self.next_round_at = 1, False, False, None
-            self.failures = []
+            self.failures, self.last_failures, self.last_sig, self.repeat = [], [], None, False
+            self.logged_at, self.unlogged, self.counted = None, [], 0
             self.next_measure = now + self.measure_interval_s
 
     def _lost_current(self, now):
@@ -652,9 +752,11 @@ class Tunnel:
             return
         self.current, self.better = None, None
         self.round, self.reconnecting, self.in_round = 1, True, False
-        self.next_round_at = now + self.restart_delay_s
+        wait = 0.0 if self.retry_now else self.restart_delay_s
+        self.retry_now = False
+        self.next_round_at = now + wait
         self.wait_note = 'dropped (%s)' % why
-        log('tunnel: no route left (%s); round 1/%d in %.1f s' % (why, self.max_failed_rounds, self.restart_delay_s))
+        log('tunnel: no route left (%s); round 1%s in %.1f s' % (why, self._limit(), wait))
 
     def _decide(self, now):
         cur = self.current
@@ -710,23 +812,100 @@ class Tunnel:
             self._die('%s:%d is already in use by another program; set field.local_port to a free port'
                       % (LOOPBACK, self.local_port))
         self._sync_routes(now)
+        self.net_sig, self.next_net_check = self.net_probe(), now + self.net_check_interval_s
+        self.retry_now = False
         self.failures, self.next_round_at, self.in_round = [], None, True
+        self.quiet = self.repeat and self.logged_at is not None and now - self.logged_at < REPEAT_LOG_S
         for r in self.routes:
             if r.state == 'down':
                 self._spawn(r, now)
 
+    def _say(self, text):
+        """A line of a round: left out while the round repeats the last one within REPEAT_LOG_S."""
+        if not self.quiet:
+            log(text)
+
+    def _limit(self):
+        return '/%d' % self.max_failed_rounds if self.max_failed_rounds else ''
+
+    @staticmethod
+    def _same(n):
+        return '%d round%s with the same result' % (n, '' if n == 1 else 's')
+
+    def _round_wait(self, done):
+        """The wait after ``done`` failed rounds in a row: restart_delay_s, doubled per round, capped."""
+        return min(self.restart_delay_max_s, self.restart_delay_s * 2 ** min(done - 1, 30))
+
     def _round_failed(self, now):
         tried = '; '.join(self.failures)
-        if self.round >= self.max_failed_rounds:
+        if self.woke_at is None or now - self.woke_at >= SHORT_WAKE_S:
+            self.counted += 1
+        if self.max_failed_rounds and self.counted >= self.max_failed_rounds:
+            self.quiet = False
             self._die('no ssh target of machine %s connects in %d round%s in a row (last round, tried in order: %s)'
-                      % (self.machine, self.round, '' if self.round == 1 else 's', tried))
+                      % (self.machine, self.counted, '' if self.counted == 1 else 's', tried))
         done = self.round
+        wait = self._round_wait(done)
+        sig = tuple(sorted(self.failures))
+        repeat = sig == self.last_sig
         self.round += 1
         self.reconnecting, self.in_round = True, False
-        self.next_round_at = now + self.restart_delay_s
-        self.wait_note = 'round %d: no target connects' % done
-        log('tunnel: round %d/%d: no target connects (tried in order: %s); round %d in %.1f s'
-            % (done, self.max_failed_rounds, tried, self.round, self.restart_delay_s))
+        self.next_round_at = now + wait
+        self.last_failures, self.last_sig, self.repeat = list(self.failures), sig, repeat
+        self.wait_note = 'round %d: no target connects (%s)' % (done, tried)
+        if self.quiet and repeat:
+            self.unlogged.append(done)
+            return
+        if not self.quiet:
+            self.logged_at = now
+        self.quiet = False
+        note = '; %s not logged' % self._same(len(self.unlogged)) if self.unlogged else ''
+        self.unlogged = []
+        log('tunnel: round %d%s: no target connects (tried in order: %s); round %d in %.1f s%s'
+            % (done, self._limit(), tried, self.round, wait, note))
+
+    def _restart_rounds(self, now):
+        """No route: stop the routes still connecting (not failures) and start round 1 now; the wait and the
+        round count start over."""
+        for r in self.routes:
+            if r.state == 'connecting':
+                self._stop_child(r)
+                self._gone(r)
+        self.round, self.in_round, self.failures, self.next_round_at = 1, False, [], now
+
+    def _wake(self, now):
+        """A clock jump of wake_jump_s or more since the last step: the machine slept (or the loop was held)."""
+        wall = self.wall()
+        tick, self.last_tick = self.last_tick, None
+        if tick is not None:
+            last_wall, last_now, delay = tick
+            jump = max((wall - last_wall) - (now - last_now), (now - last_now) - delay)
+            if jump >= self.wake_jump_s:
+                self.quiet = False
+                self.woke_at, self.counted = now, 0
+                log('tunnel: woke up (clock jump %.0f s); probing every route now' % jump)
+                if self.current is None:
+                    self._restart_rounds(now)
+                else:
+                    for r in self.routes:
+                        if r.up:  # a probe in flight from before the sleep is dropped (new gen)
+                            r.gen += 1
+                            r.wake_check, r.probing, r.next_probe = True, False, now
+                    self.next_measure = now
+        return wall
+
+    def _net_watch(self, now):
+        """No route: a new network (default routes changed to an available one) starts a round at once."""
+        if now < self.next_net_check:
+            return
+        self.next_net_check = now + self.net_check_interval_s
+        sig, old = self.net_probe(), self.net_sig
+        self.net_sig = sig
+        if old is None or any(old) or not any(sig) or (self.next_round_at is None and not self.in_round):
+            return  # only "no network -> network" starts a round at once; other changes follow the wait
+        name = lambda x: '/'.join(a for a in x if a) if x and any(x) else 'none'
+        log('tunnel: network changed (%s -> %s); round now' % (name(old), name(sig)))
+        self._restart_rounds(now)
 
     def _rounds(self, now):
         if self.next_round_at is not None:
@@ -785,12 +964,14 @@ class Tunnel:
 
     def step(self):
         now = self.clock()
+        wall = self._wake(now)
         self._drain(now)
         self._drain_refused(now)
         self._poll_children(now)
         self._deadlines(now)
         self._check_current(now)
         if self.current is None:
+            self._net_watch(now)
             self._rounds(now)
         else:
             self._cycle(now)
@@ -801,10 +982,12 @@ class Tunnel:
         self._decide(now)
         self._sync_relay(now)
         self.phase = self._phase(now)
-        return self._delay(now)
+        delay = self._delay(now)
+        self.last_tick = (wall, now, delay)
+        return delay
 
     def _delay(self, now):
-        events = [now + self.check_interval_s]
+        events = [now + self.check_interval_s, now + self.net_check_interval_s]
         for r in self.routes:
             if r.probing:
                 events.append(now + PROBE_WAIT_S)
@@ -840,14 +1023,20 @@ class Tunnel:
                 self.last_switch, ', '.join(others) or 'none')
         word = 'reconnecting' if self.reconnecting else 'connecting'
         if self.next_round_at is not None:
-            return '%s: round %d/%d in %.0f s; %s' % (word, self.round, self.max_failed_rounds,
-                                                      max(0.0, self.next_round_at - now), self.wait_note)
+            return '%s: round %d%s in %.0f s; %s' % (word, self.round, self._limit(),
+                                                     max(0.0, self.next_round_at - now), self.wait_note)
         trying = [self._label(r) for r in self.routes if r.state == 'connecting']
-        return '%s: round %d/%d, trying %s' % (word, self.round, self.max_failed_rounds, ', '.join(trying) or 'none')
+        last = ('; round %d: no target connects (%s)' % (self.round - 1, '; '.join(self.last_failures))
+                if self.last_failures else '')
+        return '%s: round %d%s, trying %s%s' % (word, self.round, self._limit(), ', '.join(trying) or 'none', last)
 
     def close(self):
+        self.quiet = False
         for r in self.routes:
             self._stop_child(r)
+        for child, _ in self.lingering:
+            if child.poll() is None:
+                child.kill()
         if self.relay is not None:
             self.relay.shutdown()
         ports = [self.local_port] + [r.port for r in self.routes]

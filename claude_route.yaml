@@ -28,9 +28,19 @@ field:
   server_alive_count_max: 3
   connect_timeout_s: 10
   attempt_timeout_s: 30     # one route: ssh start to the first good probe, else that start failed
-  restart_delay_s: 5        # no route left: wait before a round that starts every route, and between rounds
-  max_failed_rounds: 10     # rounds in a row in which no route comes up before exit 78 (a field machine that
-                            # just woke up often has no network for the first rounds); 1-10000
+  restart_delay_s: 5        # no route left: wait before a round that starts every route, and the first wait
+                            # between rounds
+  restart_delay_max_s: 60   # the wait between rounds doubles after each failed round in a row, up to this; a
+                            # route that comes up starts it over at restart_delay_s
+  max_failed_rounds: 0      # 0: no limit, rounds go on until a route comes up (a closed lid, no Wi-Fi). A
+                            # positive value: that many failed rounds in a row end the applet with exit 78; 0-10000
+  wake_jump_s: 10           # a clock jump this long between two loops is a wake-up: every route is probed at
+                            # once, dead ones are restarted, and with no route a round starts at once; 1-86400
+  net_check_interval_s: 1   # no route: look at the default routes this often (no packet is sent, never the
+                            # API); no network -> network starts a round at once. Also the longest loop
+                            # pause; 0.2-60
+  wake_probe_timeout_s: 1   # after a wake-up each route is probed with this timeout; no answer: restarted at
+                            # once; 0.1-60
   check_interval_s: 10      # probe period of the route in use
   unhealthy_restart_s: 60   # up, then probes failing this long: a drop (a few failed probes are not)
   stop_wait_s: 5            # on SIGTERM: ssh stop and listener-gone confirmation, each

@@ -57,10 +57,98 @@ pick another fleet.
 
 4. Read the home proxy log on the home machine. Each tunnel writes `homeproxy: CONNECT <host>:<port>`.
 
+## 2a. See it reconnect
+
+When no route is up, the field port is closed and the applet runs rounds until a route comes up. With the
+default `field.max_failed_rounds: 0` it never stops for failed rounds. Its state stays running; it does not go to
+`config_error`.
+
+1. Read the phase of `applet-tunnel-1`. While it waits for the next round:
+
+   ```
+   reconnecting: round <n> in <s> s; round <n-1>: no target connects (<target>: <why>; ...)
+   ```
+
+   While a round runs:
+
+   ```
+   reconnecting: round <n>, trying <target> (target i/n), ...; round <n-1>: no target connects (...)
+   ```
+
+   | Part | Meaning |
+   |---|---|
+   | `round <n>` | The number of the next or running round since the last route was up. `round <n>/<max>` only when `field.max_failed_rounds` is above 0. |
+   | `in <s> s` | Seconds to the next round. The wait doubles from `field.restart_delay_s` up to `field.restart_delay_max_s`. |
+   | `round <n-1>: no target connects (...)` | The reason of each target of the last round, in the order in which the targets failed. |
+   | `dropped (<target> dropped: <why>)` | Shown instead before the first round after the route in use dropped. |
+
+2. Read the round lines in the log. When the last route drops, the applet writes:
+
+   ```
+   tunnel: no route left (<target> dropped: <why>); round 1 in <s> s
+   ```
+
+   Each failed round writes the lines of its attempts (`start`, `<target> failed: <why>`, `measure`) and one line:
+
+   ```
+   tunnel: round <n>: no target connects (tried in order: <target>: <why>; ...); round <n+1> in <s> s
+   ```
+
+   With a positive `field.max_failed_rounds`, the round numbers read `<n>/<max>`.
+
+3. Repeated results are rate limited. While every round fails with the same reasons as the round before, the
+   applet writes the lines of a round at most once per 600 s and leaves out the rounds in between. When the
+   reasons change, the round line of that round is written at once, and the next round is written in full. The
+   first round line after rounds that were left out ends with `; <m> rounds with the same result not logged`.
+4. When a route comes up, the log shows the skipped count, if any, and the switch:
+
+   ```
+   tunnel: <m> rounds with the same result not logged (rounds <a>-<b>)
+   tunnel: switch none -> <target>: recovered
+   ```
+
+   The port is open again. No manual start is needed.
+
+5. Wake-up and network change. The applet does not wait for the round timer when the machine wakes or the
+   network returns (design.md section 4). On a wake it writes:
+
+   ```
+   tunnel: woke up (clock jump <n> s); probing every route now
+   ```
+
+   With no route up, a new round starts at once and the phase reads `reconnecting: round 1, trying ...`. With
+   routes up, every route is probed at once with the short time limit `field.wake_probe_timeout_s` (1 s by
+   default). A route that does not answer within it is stopped and started again:
+
+   ```
+   tunnel: <target> dropped: no answer after wake-up (...)
+   ```
+
+   When the route in use fails this check and no other route answered, a round starts without a wait:
+   `tunnel: no route left (<target> dropped: no answer after wake-up (...)); round 1 in 0.0 s`.
+
+   While no route is up, the applet checks the network every `field.net_check_interval_s` s. It sends nothing.
+   When a network appears where there was none, it writes:
+
+   ```
+   tunnel: network changed (none -> <address>[/<address>]); round now
+   ```
+
+   and a round starts at once. Other changes, such as a new address on a network that was already up, write no
+   line and start no round; the rounds keep their wait.
+
+6. What a lid-open looks like. After a night with the lid closed, the log shows short wakes: a `woke up` line, a
+   few failed rounds, then nothing until the next wake. The round number stays low and the wait does not grow,
+   because each wake starts over at round 1. With a positive `field.max_failed_rounds`, rounds that fail within
+   60 s of a wake are not counted, so short wakes never end the applet. When the lid opens with a working network, the log shows `woke up`
+   or `network changed`, then `switch none -> <target>: recovered`, within about 2 s plus the ssh handshake.
+   If the phase still shows `reconnecting` long after the network is back, read the reasons in it.
+
 ## 3. Common errors
 
 The field applet writes the reason of an exit as its last log line. The fleet shows that line as the reason of
-state `config_error`.
+state `config_error`. Exit code 78 comes from a configuration error. It comes from failed rounds only when
+`field.max_failed_rounds` is above 0.
 
 | Log line | Cause | Action |
 |---|---|---|
@@ -75,7 +163,10 @@ state `config_error`.
 | `config error: route_ports <a>-<b> has <n> port(s) for the <m> routes of machine <name>; widen route_ports` | The inventory lists more routes than the range holds. | Widen `field.route_ports`. |
 | `tunnel: 127.0.0.1:<p> is already in use by another program; set field.local_port to a free port` | Another program listens on `field.local_port`. | Pick another port (section 5). |
 | `tunnel: 127.0.0.1:<p> (route port of <target>) is already in use by another program; set field.route_ports to a free range` | Another program listens on a route port. | Move `field.route_ports`. |
-| `tunnel: no ssh target of machine <name> connects in <n> rounds in a row (last round, tried in order: ...)` | No route reached the home proxy. | Read the reason of each target (below). Fix a route. Run `fleetmux applet start applet-tunnel-1`. |
+| `tunnel: round <n>: no target connects (...)` | No route came up in this round. The applet keeps trying (section 2a). | Nothing while the machine sleeps or has no network. If it goes on after the network is back, read the reason of each target (below) and fix a route. |
+| `tunnel: no ssh target of machine <name> connects in <n> rounds in a row (last round, tried in order: ...)` | `field.max_failed_rounds` is above 0, and that many rounds in a row failed. | Set `field.max_failed_rounds` to `0` or remove it, so the applet keeps reconnecting. Fix a route. Run `fleetmux applet start applet-tunnel-1`. |
+| `tunnel: ssh pid <pid> of <target> does not exit; port <p> stays with it` | An old ssh child of the applet did not end, even after SIGKILL. It keeps its route port. | Nothing. The applet waits for it and does not exit. If it stays, check the process with `ps -p <pid>`. A stop of the applet kills it again. |
+| `tunnel: <target> failed: old ssh pid <pid> still holds port <p>` | A start of that route found its port held by that old child. It counts as one failed attempt. | Nothing. The route starts again after the old process ends. |
 | `tunnel: <target> failed: ssh exited with 255` | ssh could not connect or authenticate. | Run `ssh -o BatchMode=yes <target> true` and fix the ssh configuration. |
 | `tunnel: <target> failed: no healthy forward within <s> s (...)` | ssh connected, but the home proxy did not answer. | Check that `applet-homeproxy-1` is `up` on the home machine and that `field.remote_port` equals `home.port`. |
 | `... wrong service ...` | Another program answers on the home port. | Free `home.port` on the home machine, or change it on both sides. |
@@ -125,6 +216,10 @@ To keep a change:
    ```
 
 5. Unload and load the workflow again, in the order of the README.
+
+A parameter file from an older version may set `max_failed_rounds: 10` in the `field` block. With that line the
+field applet still stops after 10 failed rounds. Set it to `0` or remove the line, then apply the change as
+above.
 
 A change to `teams/field-applet.yaml` or `teams/home.yaml` takes effect only through unload and load. `load`
 copies the row into the host fleet's roster.
