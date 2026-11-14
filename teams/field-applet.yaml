@@ -1,0 +1,20 @@
+# applets: row for the field machine's root service fleet (field-fleet on field-machine; workflow applets[].roster_rows).
+# session_env makes the fleet start its Claude sessions with the proxy variables and hold them at launch while
+# 127.0.0.1:17892 is closed; the fleet itself clears inherited proxy variables and adds the loopback names to
+# NO_PROXY.
+# The port is field.local_port in ../claude_route.yaml; change both together.
+applets:
+  - name: applet-tunnel-1
+    command: ["{python}", "-m", "claude_route.field"]
+    cwd: ..
+    params: {file: ../claude_route.yaml, block: field}
+    durable_state: false
+    stop_grace_s: 15
+    lease: {max_active: 1, hot_add_max: 0}   # never requests a worker; never adds one
+    session_env:
+      port: 17892
+      vars:
+        HTTPS_PROXY: "http://127.0.0.1:17892"
+        HTTP_PROXY: "http://127.0.0.1:17892"
+        NO_PROXY: "localhost,127.0.0.1,::1"
+      clis: [claude]

@@ -1,0 +1,48 @@
+# claude-route parameters: one file, one block per applet. fleetmux passes the file and the block name to the
+# applet and does not read the blocks itself. Unknown keys are refused (exit 78).
+
+# ---- block: home (applet-homeproxy-1, machine home-machine, fleet home-fleet) -------------------------------
+home:
+  port: 17891               # loopback port of the CONNECT proxy; the bind address is always 127.0.0.1
+  allow_ports: [443]        # CONNECT target ports the proxy accepts
+  connect_timeout_s: 10     # outbound TCP connect
+  idle_timeout_s: 900       # a tunnel with no traffic this long is closed
+  check_interval_s: 10      # self health check period
+
+# ---- block: field (applet-tunnel-1, machine field-machine, fleet field-fleet) -----------------------------
+# Every route (reach entry) gets its own ssh forward on a route port; the applet serves local_port itself and
+# hands each new connection to the best route. Scores and switches: see docs/design.md, section 3.
+field:
+  machine: home-machine     # required, no default. Example value: change it to your own home machine's name in
+                            # the machines block of fleet-superpowers (fleetmux superpowers show --machines).
+                            # Its reach list (machines.<machine>.reach[].ssh, in order) is the only source of
+                            # ssh targets
+  local_port: 17892         # loopback port on the field machine = session_env.port in teams/field-applet.yaml;
+                            # never 7890 9090 9091 17890 19091 18888 16379 16380 18790 18793 14001
+  remote_port: 17891        # = home.port
+  route_ports: [17900, 17915] # first and last loopback port of the routes' ssh forwards (one per route); must
+                            # not hold a reserved port or local_port, and must have a port for every route
+  ssh: [ssh]
+  ssh_options: []           # extra "Key=Value" options; the fixed ones (BatchMode, ...) come first and win
+  server_alive_interval_s: 15
+  server_alive_count_max: 3
+  connect_timeout_s: 10
+  attempt_timeout_s: 30     # one route: ssh start to the first good probe, else that start failed
+  restart_delay_s: 5        # no route left: wait before a round that starts every route, and between rounds
+  max_failed_rounds: 10     # rounds in a row in which no route comes up before exit 78 (a field machine that
+                            # just woke up often has no network for the first rounds); 1-10000
+  check_interval_s: 10      # probe period of the route in use
+  unhealthy_restart_s: 60   # up, then probes failing this long: a drop (a few failed probes are not)
+  stop_wait_s: 5            # on SIGTERM: ssh stop and listener-gone confirmation, each
+  probe_timeout_s: 5        # one probe (health request through a route); slower counts as failed
+  samples: 5                # probes per measurement; the speed is the median of the last this many good ones
+  sample_gap_s: 1           # between the probes of one measurement
+  measure_interval_s: 60    # measurement period of the routes not in use; the inventory is read again then
+  window_s: 600             # history the score looks at (failed-probe share, drops, good probe times)
+  fail_penalty_ms: 5000     # score = median ms + fail_penalty_ms x failed share + drop_penalty_ms x drops
+  drop_penalty_ms: 2000
+  switch_margin_ratio: 0.3  # switch to a better route only at a score <= (1 - ratio) x the one in use,
+  switch_margin_ms: 50      # at least this many ms lower,
+  switch_hold_s: 120        # for this long without a break,
+  switch_cooldown_s: 300    # and not within this long of the last switch between routes
+  failover_after_fails: 3   # failed probes in a row on the route in use: switch at once to the best other one

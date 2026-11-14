@@ -1,0 +1,11 @@
+# applets: row for the home machine's root service fleet (home-fleet on home-machine). `fleetmux superpowers
+# load` appends it to the host fleet's run roster (workflow entry applets[].roster_rows); cwd and params.file are
+# resolved against this file.
+applets:
+  - name: applet-homeproxy-1
+    command: ["{python}", "-m", "claude_route.home"]
+    cwd: ..
+    params: {file: ../claude_route.yaml, block: home}
+    durable_state: false
+    stop_grace_s: 10
+    lease: {max_active: 1, hot_add_max: 0}   # never requests a worker; never adds one

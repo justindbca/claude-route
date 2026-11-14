@@ -1,0 +1,32 @@
+# fleet-superpowers workflows entry (fleetmux docs/distributed-development.md, "workflows entry schema").
+# This file is workflow.yaml (claude_route.WORKFLOW_FILE). The `kind` value is the entry type the fleetmux
+# schema requires.
+#
+# This is a template. Every machine name, fleet name and source.repo below is an example value. Change them to
+# your own before you save the entry:
+# - home-machine: the home machine's name, as `fleetmux superpowers show --machines` prints it on both machines.
+# - field-machine: the field machine's name, the same way.
+# - home-fleet / field-fleet: the root service fleet on each machine that hosts the applet.
+# - source.repo: the path of this repository's clone, the same path on both machines. fleetmux accepts a local
+#   path only: absolute, or under each user's home (`~/...`). A URL is not accepted.
+# - source.ref: the commit of the applet files in your clone.
+# Keep field.machine in claude_route.yaml equal to applets[0].machine.
+#
+# Save with (on field-machine): fleetmux superpowers save workflow.yaml --also home-machine
+claude-via-home:
+  kind: workflow
+  summary: Route the Claude sessions that the field fleet starts through an HTTP CONNECT proxy on the home machine, reached over the existing ssh route.
+  applies_when:
+    - The field machine cannot reach the Claude API. Loading this workflow sends every Claude session of the field fleet through home; nothing tests the direct route.
+  source:
+    repo: ~/claude-route
+    ref: e45316f66fafa1f9b72bb902d5d2e192a2f17c73   # load accepts this commit or a later one with the same applet files
+    from: home-machine
+  applets:
+    - machine: home-machine
+      fleet: home-fleet
+      roster_rows: teams/home.yaml
+    - machine: field-machine
+      fleet: field-fleet
+      roster_rows: teams/field-applet.yaml
+  saved_on: [home-machine, field-machine]

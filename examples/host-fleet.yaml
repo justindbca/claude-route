@@ -1,0 +1,10 @@
+# Minimal roster for the fleet that hosts a claude-route applet, on either machine (one file for both ends).
+#
+# Neither applet calls an AI model or leases a worker (lease max_active 1, hot_add_max 0 in teams/*.yaml), so the
+# host fleet needs only its supervisor. fleetmux refuses a roster with an empty workers list ("the roster needs
+# at least one worker"), so this roster holds the smallest allowed form: one plain worker with no role file.
+# The supervisor is not a roster row; fleetmux always starts it.
+#
+# `fleetmux superpowers load` appends the applets: rows to the host fleet's run roster; nothing else here changes.
+workers:
+  - name: worker-1
